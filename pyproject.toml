@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cso2iso"
+version = "1.0.0"
+description = "Convert compressed disc images (.cso/.zso/.ciso) back into plain .iso files"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Cyd Villavicencio" }]
+keywords = ["cso", "ciso", "zso", "ziso", "iso", "disc image", "psp", "ps2", "converter"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Compression",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+# Only a speed-up for .zso/LZ4 images; the tool works without it.
+lz4 = ["lz4>=4.0"]
+
+[project.urls]
+Homepage = "https://cydvilla.github.io/cso-to-iso/"
+Source = "https://github.com/CydVilla/cso-to-iso"
+Issues = "https://github.com/CydVilla/cso-to-iso/issues"
+
+[project.scripts]
+cso2iso = "cso2iso:main"
+
+[tool.setuptools]
+py-modules = ["cso2iso"]
