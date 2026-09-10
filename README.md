@@ -187,6 +187,9 @@ pyinstaller --onefile --console --name cso2iso cso2iso.py
 ```
 
 Pushing a `v*` tag builds all four downloads and publishes them as a release.
+The Windows binary is signed on the way through, which is what removes the
+SmartScreen warning; [.github/SIGNING.md](.github/SIGNING.md) covers the Azure
+setup that switches it on.
 
 ## Licence
 

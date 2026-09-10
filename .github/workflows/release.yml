@@ -27,6 +27,10 @@ jobs:
           - { os: macos-14, target: macos-arm64 }
           - { os: windows-latest, target: windows-x86_64 }
     timeout-minutes: 30
+    # Exposed as env so the signing step can be skipped when the Azure
+    # credentials are not configured yet. See .github/SIGNING.md
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +56,38 @@ jobs:
       - name: Build the standalone binary
         shell: bash
         run: pyinstaller --onefile --console --name cso2iso cso2iso.py
+
+      # Windows shows a SmartScreen warning for unsigned programs. Signing
+      # happens before the smoke test so a broken signature fails the build
+      # rather than reaching a release. Skipped entirely until the secrets in
+      # .github/SIGNING.md exist, so unsigned releases keep working.
+      - name: Sign the Windows binary
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        uses: azure/artifact-signing-action@v2
+        env:
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the signature
+        if: runner.os == 'Windows' && env.AZURE_CLIENT_ID != ''
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist\cso2iso.exe
+          $sig | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+          if ($sig.Status -ne "Valid") {
+            Write-Error "signature is $($sig.Status), refusing to publish"
+            exit 1
+          }
+          Write-Host "signed by $($sig.SignerCertificate.Subject)"
 
       - name: Smoke test the binary
         shell: bash
