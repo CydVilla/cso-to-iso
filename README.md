@@ -26,6 +26,13 @@ $ cso2iso 'Wipeout Pure.cso'
   Wipeout Pure.cso  ->  Wipeout Pure.iso  (1.7 GiB, 512.4 MiB/s in 0:03)
 ```
 
+## No install at all
+
+The [download page](https://cydvilla.github.io/cso-to-iso/#browser) converts
+files in the browser. Drop a `.cso` in and the `.iso` comes back out. Nothing is
+uploaded, since the work happens on your own machine, and there is no download
+and no security prompt to click through.
+
 ## Download
 
 | System | File |
@@ -53,8 +60,15 @@ bar, press <kbd>Enter</kbd> and run:
 cso2iso.exe "C:\games\Wipeout Pure.cso"
 ```
 
-The first launch may bring up *Windows protected your PC*, because these builds
-are not code signed. Choose **More info**, then **Run anyway**.
+On the first run Windows shows a blue **Windows protected your PC** box.
+
+1. Click **More info**, which reveals a button the box hides by default.
+2. Click **Run anyway**.
+
+It appears because these builds carry no code signature, not because anything is
+wrong with the file. You only need to do it once per download. To skip it
+entirely, use [the browser converter](https://cydvilla.github.io/cso-to-iso/#browser),
+which needs no download at all.
 
 ### macOS
 

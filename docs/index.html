@@ -137,6 +137,31 @@
     padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 18px 0 0; font-size: .93rem;
   }
   footer { padding: 34px 0 60px; text-align: center; color: var(--muted); font-size: .9rem; }
+
+  .drop {
+    border: 2px dashed var(--line); border-radius: 14px; padding: 34px 20px;
+    text-align: center; background: var(--panel); cursor: pointer;
+    transition: border-color .12s ease, background .12s ease;
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop strong { display: block; font-size: 1.05rem; margin-bottom: 3px; }
+  .drop .muted { color: var(--muted); font-size: .92rem; margin: 0; }
+  .linkbtn {
+    background: none; border: 0; padding: 0; font: inherit; cursor: pointer;
+    color: var(--accent); text-decoration: underline;
+  }
+  .job {
+    margin-top: 15px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 13px; padding: 18px;
+  }
+  .job h3 { margin: 0 0 2px; font-size: 1rem; word-break: break-all; }
+  .job .meta { color: var(--muted); font-size: .88rem; margin: 0 0 14px; }
+  .bar { height: 9px; background: var(--line); border-radius: 999px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .15s linear; }
+  .status { font-size: .88rem; color: var(--muted); margin: 10px 0 0; font-variant-numeric: tabular-nums; }
+  .actions { margin: 15px 0 0; }
+  .err { color: #b3261e; }
+  @media (prefers-color-scheme: dark) { .err { color: #ff8f7a; } }
 </style>
 </head>
 <body>
@@ -163,8 +188,32 @@
       Download <small id="primary-os">for your system</small>
     </a>
     <p class="sub"><span id="release-version">Free and open source</span> · Windows, macOS and Linux · one self-contained file</p>
+    <p class="sub" style="margin-top:6px">or <a href="#browser">convert right here in your browser</a>, no download at all</p>
   </div>
 </header>
+
+<section id="browser">
+  <div class="wrap">
+    <h2>Convert in your browser</h2>
+    <p class="lede">Nothing is uploaded. The file is read on your own machine, converted here, and saved straight back.</p>
+
+    <div class="drop" id="drop">
+      <input type="file" id="picker" accept=".cso,.zso,.ciso" hidden>
+      <strong>Drop a .cso or .zso file here</strong>
+      <p class="muted">or <button type="button" class="linkbtn" id="browse">choose a file</button></p>
+    </div>
+
+    <div class="job" id="job" hidden>
+      <h3 id="job-name"></h3>
+      <p class="meta" id="job-meta"></p>
+      <div class="bar"><i id="job-bar"></i></div>
+      <p class="status" id="job-status"></p>
+      <p class="actions"><button class="btn" id="go">Convert to ISO</button></p>
+    </div>
+
+    <p class="note" id="browser-note" hidden></p>
+  </div>
+</section>
 
 <section>
   <div class="wrap">
@@ -216,10 +265,11 @@
         <ol>
           <li>Unzip the download. You get a folder with <code>cso2iso.exe</code> inside.</li>
           <li>Drag your <code>.cso</code> file onto <code>cso2iso.exe</code>. The <code>.iso</code> appears next to the original.</li>
+          <li>On the first run Windows shows a blue <em>Windows protected your PC</em> box. Click <strong>More info</strong>, then <strong>Run anyway</strong>. It appears because the build carries no code signature, and you only need to do it once per download.</li>
           <li>Prefer typing? Open the folder, type <code>cmd</code> in the address bar, press Enter, then run:</li>
         </ol>
         <pre>cso2iso.exe "C:\games\Wipeout Pure.cso"</pre>
-        <p class="note">The first launch may show <em>Windows protected your PC</em>, because the build is not code signed. Choose <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+        <p class="note">Would rather not see that box at all? <a href="#browser">The browser converter above</a> needs no download and no permission from Windows.</p>
       </div>
       <div class="panel" id="p-mac">
         <ol>
@@ -282,7 +332,147 @@ cso2iso --info game.cso          <span class="c"># show what is inside, convert 
   </div>
 </footer>
 
+<script src="convert.js"></script>
 <script>
+  (function () {
+    var drop = document.getElementById("drop");
+    var picker = document.getElementById("picker");
+    var job = document.getElementById("job");
+    var jobName = document.getElementById("job-name");
+    var jobMeta = document.getElementById("job-meta");
+    var jobBar = document.getElementById("job-bar");
+    var jobStatus = document.getElementById("job-status");
+    var actions = document.querySelector("#job .actions");
+    var go = document.getElementById("go");
+    var note = document.getElementById("browser-note");
+    var current = null, header = null, busy = false;
+
+    function size(n) {
+      var units = ["B", "KiB", "MiB", "GiB", "TiB"], i = 0;
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+    }
+    function clock(seconds) {
+      seconds = Math.max(0, Math.round(seconds));
+      var m = Math.floor(seconds / 60);
+      return m + ":" + String(seconds % 60).padStart(2, "0");
+    }
+    function say(text, isError) {
+      jobStatus.textContent = text;
+      jobStatus.className = isError ? "status err" : "status";
+    }
+
+    if (!window.cso2iso || !cso2iso.supported) {
+      note.hidden = false;
+      note.textContent = "This browser cannot decompress in page. Use one of the downloads below instead.";
+      drop.style.display = "none";
+      return;
+    }
+
+    async function load(file) {
+      if (busy) return;
+      current = file; header = null;
+      job.hidden = false;
+      jobName.textContent = file.name;
+      jobBar.style.width = "0";
+      actions.hidden = false;
+      go.disabled = false;
+      go.textContent = "Convert to ISO";
+      try {
+        var head = new Uint8Array(await file.slice(0, 24).arrayBuffer());
+        header = cso2iso.parseHeader(head);
+        jobMeta.textContent = header.formatName + " · " + size(file.size) +
+          " compressed · " + size(header.totalBytes) + " once expanded";
+        var big = header.totalBytes > 1.5 * 1024 * 1024 * 1024;
+        say(big && !cso2iso.canSaveToDisk
+          ? "Large image. This browser has to build it in memory, so Chrome or Edge will cope better."
+          : "Ready.");
+      } catch (err) {
+        jobMeta.textContent = size(file.size);
+        actions.hidden = true;
+        say(err.message, true);
+      }
+    }
+
+    async function run() {
+      if (!current || !header || busy) return;
+      var target = current.name.replace(/\.(cso|zso|ciso)$/i, "") + ".iso";
+      var sink, handle = null;
+      try {
+        if (cso2iso.canSaveToDisk) {
+          handle = await window.showSaveFilePicker({
+            suggestedName: target,
+            types: [{ description: "Disc image", accept: { "application/octet-stream": [".iso"] } }]
+          });
+          sink = await cso2iso.fileSink(handle);
+        } else {
+          sink = cso2iso.blobSink();
+        }
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+        say(err.message, true);
+        return;
+      }
+
+      busy = true;
+      go.disabled = true;
+      go.textContent = "Converting…";
+      try {
+        var result = await cso2iso.convert(current, sink, function (done, total, seconds) {
+          var fraction = done / total;
+          jobBar.style.width = (fraction * 100).toFixed(1) + "%";
+          var rate = done / Math.max(seconds, 0.001);
+          say(size(done) + " of " + size(total) + "  ·  " + size(rate) + "/s  ·  " +
+              clock((total - done) / Math.max(rate, 1)) + " left");
+        });
+        jobBar.style.width = "100%";
+        if (result.blob) {
+          var url = URL.createObjectURL(result.blob);
+          var link = document.createElement("a");
+          link.href = url;
+          link.download = target;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+          say("Done in " + clock(result.seconds) + ". Saving " + target + " to your downloads.");
+        } else {
+          say("Done in " + clock(result.seconds) + ". Saved as " + target + ".");
+        }
+        actions.hidden = true;
+      } catch (err) {
+        say(err.message, true);
+        go.disabled = false;
+        go.textContent = "Try again";
+      } finally {
+        busy = false;
+      }
+    }
+
+    drop.addEventListener("click", function () { if (!busy) picker.click(); });
+    document.getElementById("browse").addEventListener("click", function (event) {
+      event.stopPropagation();
+      if (!busy) picker.click();
+    });
+    picker.addEventListener("change", function () {
+      if (picker.files && picker.files[0]) load(picker.files[0]);
+    });
+    ["dragenter", "dragover"].forEach(function (name) {
+      drop.addEventListener(name, function (event) {
+        event.preventDefault();
+        drop.classList.add("over");
+      });
+    });
+    ["dragleave", "drop"].forEach(function (name) {
+      drop.addEventListener(name, function () { drop.classList.remove("over"); });
+    });
+    drop.addEventListener("drop", function (event) {
+      event.preventDefault();
+      if (event.dataTransfer.files && event.dataTransfer.files[0]) load(event.dataTransfer.files[0]);
+    });
+    go.addEventListener("click", run);
+  })();
+
   (function () {
     var ua = navigator.userAgent;
     var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
