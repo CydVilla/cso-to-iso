@@ -193,6 +193,13 @@ alignment, partial final blocks, truncated and corrupt files, and the command
 line itself. It needs nothing but the standard library; installing `lz4` runs
 the same tests through the native decoder as well.
 
+The browser converter lives in [docs/convert.js](docs/convert.js) and shares its
+logic with the Python version. It vendors one third-party file,
+[fflate](https://github.com/101arrowz/fflate) under the MIT licence, because a
+synchronous inflate is around five times faster on 2 KB blocks than building a
+`DecompressionStream` per block. If that file fails to load the page falls back
+to the browser's own decompressor.
+
 To build a standalone binary for the system you are on:
 
 ```bash

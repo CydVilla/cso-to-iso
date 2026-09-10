@@ -14,6 +14,7 @@
   var POSITION_MASK = 0x7fffffff;
   var WINDOW = 8 << 20;
   var BLOB_FLUSH = 48 << 20;
+  var BATCH = 4 << 20;
 
   function CsoError(message) {
     var err = new Error(message);
@@ -130,6 +131,29 @@
     return out;
   }
 
+  /* The fast path. fflate decodes a block with no stream to construct and no
+     promise to await, which is worth about five times the throughput of
+     DecompressionStream on blocks this small. `out` doubles as the length
+     limit, so alignment padding is ignored and an over-long final block is
+     truncated, matching what the Python version does. */
+  function inflateFast(payload, wanted, scratch) {
+    try {
+      return window.fflate.inflateSync(payload, { out: scratch.subarray(0, wanted) });
+    } catch (err) {
+      throw CsoError("deflate error: " + err.message);
+    }
+  }
+
+  function decodeFast(payload, header, wanted, scratch) {
+    if (header.magic === ZISO) return lz4Decompress(payload, wanted);
+    if (header.version < 2) return inflateFast(payload, wanted, scratch);
+    try {
+      return inflateFast(payload, wanted, scratch);
+    } catch (err) {
+      return lz4Decompress(payload, wanted);
+    }
+  }
+
   async function decodeBlock(payload, header, wanted) {
     if (header.magic === ZISO) return lz4Decompress(payload, wanted);
     if (header.version < 2) return inflateRaw(payload, wanted);
@@ -147,6 +171,15 @@
     this.start = 0;
     this.buf = new Uint8Array(0);
   }
+  /* Returns the bytes straight away when they are already in the window, so
+     the hot loop only goes async when the file actually has to be read. */
+  Reader.prototype.peek = function (offset, length) {
+    if (offset >= this.start && offset + length <= this.start + this.buf.length) {
+      var from = offset - this.start;
+      return this.buf.subarray(from, from + length);
+    }
+    return null;
+  };
   Reader.prototype.bytes = async function (offset, length) {
     if (offset < this.start || offset + length > this.start + this.buf.length) {
       var span = Math.max(WINDOW, length);
@@ -194,35 +227,74 @@
     var indexBytes = await reader.bytes(header.headerSize, header.indexSize);
     var index = new Uint32Array(indexBytes.slice().buffer);
 
+    var fast = !!(window.fflate && typeof window.fflate.inflateSync === "function");
+    var scratch = new Uint8Array(header.blockSize);
+    var step = Math.pow(2, header.align);
+
+    // Blocks are gathered into a large buffer before reaching the sink. Writing
+    // 2 KB at a time to a file on disk costs far more than the decoding does.
+    var batchSize = Math.max(BATCH, header.blockSize);
+    var batch = new Uint8Array(batchSize);
+    var used = 0;
+
     var written = 0;
     var started = performance.now();
+    var lastPaint = started;
+
     for (var i = 0; i < header.numBlocks; i++) {
       var entry = index[i];
-      var offset = (entry & POSITION_MASK) * Math.pow(2, header.align);
-      var stored = (index[i + 1] & POSITION_MASK) * Math.pow(2, header.align) - offset;
+      var offset = (entry & POSITION_MASK) * step;
+      var stored = (index[i + 1] & POSITION_MASK) * step - offset;
       if (stored <= 0) throw CsoError("block " + i + " has an invalid stored size of " + stored);
 
-      var payload = await reader.bytes(offset, stored);
+      var payload = reader.peek(offset, stored);
+      if (payload === null) payload = await reader.bytes(offset, stored);
+
       var wanted = Math.min(header.blockSize, header.totalBytes - written);
       var block;
       if (entry & PLAIN_FLAG) {
         if (payload.length < wanted) throw CsoError("stored block " + i + " is short");
-        block = payload.slice(0, wanted);
+        block = payload;
+      } else if (fast) {
+        block = decodeFast(payload, header, wanted, scratch);
       } else {
         block = await decodeBlock(payload, header, wanted);
       }
-      await sink.write(block);
+      if (block.length < wanted) {
+        throw CsoError("block " + i + " decoded to " + block.length + " of " + wanted + " bytes");
+      }
+
+      if (used + wanted > batchSize) {
+        await sink.write(batch.subarray(0, used));
+        batch = new Uint8Array(batchSize);
+        used = 0;
+      }
+      batch.set(block.subarray(0, wanted), used);
+      used += wanted;
       written += wanted;
 
-      if (onProgress && (i % 256 === 0 || i === header.numBlocks - 1)) {
-        onProgress(written, header.totalBytes, (performance.now() - started) / 1000);
+      // The fast path never yields on its own, so hand the browser a moment to
+      // repaint every so often, otherwise the progress bar would not move.
+      if (i % 256 === 0 || i === header.numBlocks - 1) {
+        var now = performance.now();
+        if (now - lastPaint >= 50 || i === header.numBlocks - 1) {
+          lastPaint = now;
+          if (onProgress) onProgress(written, header.totalBytes, (now - started) / 1000);
+          await new Promise(function (resume) { setTimeout(resume, 0); });
+        }
       }
     }
+    if (used) await sink.write(batch.subarray(0, used));
+
     if (written !== header.totalBytes) {
       throw CsoError("wrote " + written + " bytes but the header promised " + header.totalBytes);
     }
     var result = await sink.finish();
-    return { header: header, bytes: written, blob: result, seconds: (performance.now() - started) / 1000 };
+    return {
+      header: header, bytes: written, blob: result,
+      seconds: (performance.now() - started) / 1000,
+      decoder: fast ? "fflate" : "DecompressionStream"
+    };
   }
 
   window.cso2iso = {
