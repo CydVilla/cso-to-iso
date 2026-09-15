@@ -6,6 +6,8 @@
 
 One small download, nothing to install, no dependencies. Windows, macOS and Linux.
 
+<a href="https://paypal.me/villacv"><img src="https://img.shields.io/badge/PayPal-Support%20this%20project-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Support this project on PayPal"></a>
+
 [![CI](https://github.com/CydVilla/cso-to-iso/actions/workflows/ci.yml/badge.svg)](https://github.com/CydVilla/cso-to-iso/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/CydVilla/cso-to-iso?color=5b4bd6&label=release)](https://github.com/CydVilla/cso-to-iso/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/CydVilla/cso-to-iso/total?color=5b4bd6)](https://github.com/CydVilla/cso-to-iso/releases)
