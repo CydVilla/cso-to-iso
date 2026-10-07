@@ -2,7 +2,7 @@
 
 # cso2iso
 
-**Turn compressed `.cso` and `.zso` disc images back into plain `.iso` files.**
+**Turn compressed `.cso` and `.zso` disc images back into plain `.iso` files, and `.iso` files into `.cso`.**
 
 One small download, nothing to install, no dependencies. Windows, macOS and Linux.
 
@@ -21,11 +21,15 @@ One small download, nothing to install, no dependencies. Windows, macOS and Linu
 
 CSO is a compressed disc image: an ISO squeezed down block by block. Emulators
 read it happily, but plenty of other software wants a real ISO. `cso2iso` puts
-one back, byte for byte.
+one back, byte for byte. It also goes the other way, packing an ISO into a CSO
+that PSP custom firmware and emulators can load directly.
 
 ```
 $ cso2iso 'Wipeout Pure.cso'
   Wipeout Pure.cso  ->  Wipeout Pure.iso  (1.7 GiB, 512.4 MiB/s in 0:03)
+
+$ cso2iso 'Vice City Stories.iso'
+  Vice City Stories.iso  ->  Vice City Stories.cso  (895.9 MiB, 55.4% of the original, 318.4 MiB/s in 0:05)
 ```
 
 ## No install at all
@@ -33,7 +37,8 @@ $ cso2iso 'Wipeout Pure.cso'
 The [download page](https://cydvilla.github.io/cso-to-iso/#browser) converts
 files in the browser. Drop a `.cso` in and the `.iso` comes back out. Nothing is
 uploaded, since the work happens on your own machine, and there is no download
-and no security prompt to click through.
+and no security prompt to click through. The browser converter only expands
+images; compressing an ISO needs the program below.
 
 ## Download
 
@@ -53,7 +58,8 @@ in public by [the release workflow](.github/workflows/release.yml).
 ### Windows
 
 Unzip the download, then **drag your `.cso` file onto `cso2iso.exe`**. The
-`.iso` lands next to the original.
+`.iso` lands next to the original. Drag an `.iso` on instead and you get a
+`.cso` back.
 
 To type commands instead, open the unzipped folder, type `cmd` in the address
 bar, press <kbd>Enter</kbd> and run:
@@ -116,16 +122,21 @@ pipx install git+https://github.com/CydVilla/cso-to-iso
 ## Usage
 
 ```
-cso2iso game.cso                 write game.iso next to game.cso
-cso2iso game.cso out/game.iso    choose the output name
-cso2iso *.cso -o isos/           convert a whole folder into isos/
-cso2iso --info game.cso          print what is inside, convert nothing
+cso2iso game.cso                  write game.iso next to game.cso
+cso2iso game.iso                  write game.cso next to game.iso
+cso2iso game.cso -o out/game.iso  choose the output name
+cso2iso *.cso -o isos/            convert a whole folder into isos/
+cso2iso --info game.cso           print what is inside, convert nothing
 ```
+
+The direction is picked per file. Compressed images are expanded, and plain ISOs
+are compressed, so a folder of mixed files can go through in one run.
 
 | Option | What it does |
 | --- | --- |
 | `-o`, `--output PATH` | Output file, or a directory when there are several inputs |
 | `-f`, `--force` | Overwrite files that already exist |
+| `-c`, `--compress` | Compress every input to `.cso`, whatever it is named |
 | `-i`, `--info` | Show the image details and stop |
 | `-q`, `--quiet` | Only report errors |
 | `--no-gui` | Never open the file picker |
@@ -161,6 +172,18 @@ checks against the reference C library. The prebuilt downloads bundle that C
 library for speed; if you run the script yourself and convert `.zso` files
 often, `pip install lz4` gives you the same speed-up.
 
+## What it writes
+
+Compressing produces CISO v1: deflate blocks of 2048 bytes at the strongest
+setting. This is the variant that every CSO reader understands, including PSP
+custom firmware such as ARK and PRO, Adrenaline on the Vita, and PPSSPP.
+
+A file counts as a plain ISO when it carries an ISO 9660 volume descriptor or
+ends in `.iso`. Anything else is treated as a compressed image, so pass
+`--compress` to pack a file with some other name. Blocks run through every CPU
+core at once. The result is identical to a single-threaded compressor's, only
+several times faster.
+
 ## How it works
 
 A CSO is a 24-byte header, a table of block offsets, then the blocks. The header
@@ -177,9 +200,16 @@ the result out in order. Two details matter for getting the bytes exactly right:
   between blocks. Deflate stops at its own end marker, but LZ4 has none, so the
   decoder is told how many bytes to produce and ignores whatever follows.
 
-The ISO is written to a `.part` file and only renamed once every block has been
-written, so an interrupted run cannot leave behind a truncated image that looks
-complete.
+Compressing is the same walk in reverse. Each block is deflated on its own,
+and any block that comes out no smaller is stored as-is with the top bit set.
+An ISO whose size is not a whole number of blocks has its final block padded
+with zeros, and the header records the true size so expanding trims the padding
+off again. Offsets have 31 bits, which covers 2 GiB. Anything that fits on a UMD
+stays under that, and larger images get the smallest alignment that reaches.
+
+Either way, the output is written to a `.part` file and only renamed once every
+block has been written, so an interrupted run cannot leave behind a truncated
+image that looks complete.
 
 ## Development
 
@@ -192,7 +222,9 @@ python3 -m unittest discover -s tests -t . -v
 The suite builds CSO and ZSO images in memory with a miniature compressor and
 converts them back, covering deflate and LZ4 blocks, stored blocks, index
 alignment, partial final blocks, truncated and corrupt files, and the command
-line itself. It needs nothing but the standard library; installing `lz4` runs
+line itself. Compression is checked by round trips, by comparing its output
+with that miniature compressor's, and by running it with and without worker
+processes. It needs nothing but the standard library; installing `lz4` runs
 the same tests through the native decoder as well.
 
 The browser converter lives in [docs/convert.js](docs/convert.js) and shares its
