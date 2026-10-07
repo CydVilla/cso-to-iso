@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cso2iso"
 version = "1.0.0"
-description = "Convert compressed disc images (.cso/.zso/.ciso) back into plain .iso files"
+description = "Convert compressed disc images (.cso/.zso/.ciso) back into plain .iso files, and .iso into .cso"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

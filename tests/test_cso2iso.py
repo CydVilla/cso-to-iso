@@ -1,7 +1,8 @@
 """Tests for cso2iso.
 
 The suite builds CSO/ZSO images in memory with a miniature compressor and then
-checks that converting them back reproduces the original bytes exactly.
+checks that converting them back reproduces the original bytes exactly. The
+real compressor is checked against that miniature one and against itself.
 """
 
 import io
@@ -12,6 +13,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -243,6 +245,138 @@ class TestLz4Decoder(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# compression
+# --------------------------------------------------------------------------
+
+
+def unpack_index(image):
+    header = cso2iso.parse_header(image)
+    return struct.unpack_from("<%dI" % (header.num_blocks + 1), image, cso2iso.HEADER_SIZE)
+
+
+class TestCompress(TempDirCase):
+    def compress(self, data, **kwargs):
+        source = self.write("image.iso", data)
+        destination = self.tmp / "image.cso"
+        result = cso2iso.compress(source, destination, force=True, **kwargs)
+        return result, destination.read_bytes()
+
+    def expand(self, image):
+        source = self.write("again.cso", image)
+        destination = self.tmp / "again.iso"
+        cso2iso.convert(source, destination, force=True)
+        return destination.read_bytes()
+
+    def test_round_trip_is_byte_identical(self):
+        for size in (2048 * 40, 2048 * 40 + 517, 2048 * 3 + 1, 11):
+            with self.subTest(size=size):
+                data = sample_data(size, seed=size)
+                _, image = self.compress(data)
+                self.assertEqual(self.expand(image), data)
+
+    def test_header_fields(self):
+        data = sample_data(2048 * 9 + 100)
+        result, image = self.compress(data)
+        magic, header_size, total, block_size, version, align, reserved = struct.unpack_from(
+            "<4sIQIBBH", image)
+        self.assertEqual(magic, b"CISO")
+        self.assertEqual(header_size, 24)
+        self.assertEqual(total, len(data))
+        self.assertEqual(block_size, 2048)
+        self.assertEqual(version, 1)
+        self.assertEqual(align, 0)
+        self.assertEqual(reserved, 0)
+        self.assertEqual(result.header, cso2iso.parse_header(image))
+        self.assertEqual(result.compressed_size, len(image))
+
+    def test_index_layout(self):
+        image = self.compress(sample_data(2048 * 9 + 100))[1]
+        index = unpack_index(image)
+        self.assertEqual(len(index), 11)
+        self.assertEqual(index[0] & cso2iso.POSITION_MASK, 24 + 11 * 4)
+        self.assertEqual(index[-1], len(image))
+        positions = [entry & cso2iso.POSITION_MASK for entry in index]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_matches_the_reference_layout(self):
+        # make_cso is the straightforward single-process version of the same
+        # format, so whole-block images must come out identical to it.
+        data = sample_data(2048 * 30, seed=99)
+        self.assertEqual(self.compress(data)[1], make_cso(data))
+
+    def test_incompressible_blocks_are_stored_raw(self):
+        noise = random.Random(5).randbytes(2048)
+        data = bytes(2048) + noise + bytes(2048)
+        image = self.compress(data)[1]
+        index = unpack_index(image)
+        self.assertFalse(index[0] & cso2iso.PLAIN_FLAG)
+        self.assertTrue(index[1] & cso2iso.PLAIN_FLAG)
+        self.assertFalse(index[2] & cso2iso.PLAIN_FLAG)
+        start = index[1] & cso2iso.POSITION_MASK
+        self.assertEqual((index[2] & cso2iso.POSITION_MASK) - start, 2048)
+        self.assertEqual(image[start:start + 2048], noise)
+        self.assertEqual(self.expand(image), data)
+
+    def test_partial_final_block_is_padded_to_a_whole_block(self):
+        tail = random.Random(8).randbytes(700)
+        data = bytes(2048) + tail
+        image = self.compress(data)[1]
+        self.assertEqual(cso2iso.parse_header(image).total_bytes, len(data))
+        index = unpack_index(image)
+        stored = image[index[1] & cso2iso.POSITION_MASK:]
+        block = stored if index[1] & cso2iso.PLAIN_FLAG else zlib.decompress(stored, -15)
+        self.assertEqual(block, tail + bytes(2048 - 700))
+        self.assertEqual(self.expand(image), data)
+
+    def test_worker_processes_give_the_same_image(self):
+        data = sample_data(2048 * 40 + 517, seed=3)
+        with mock.patch.object(cso2iso, "COMPRESS_BATCH", 4):
+            pooled = self.compress(data, workers=2)[1]
+        single = self.compress(data, workers=1)[1]
+        self.assertEqual(pooled, single)
+        self.assertEqual(self.expand(pooled), data)
+
+    def test_index_alignment(self):
+        for align in (1, 4, 11):
+            with self.subTest(align=align):
+                data = sample_data(2048 * 12 + 9, seed=align)
+                _, image = self.compress(data, align=align)
+                self.assertEqual(cso2iso.parse_header(image).align, align)
+                self.assertEqual(len(image) % (1 << align), 0)
+                self.assertEqual(unpack_index(image)[-1] << align, len(image))
+                self.assertEqual(self.expand(image), data)
+
+    def test_alignment_is_only_used_past_2_gib(self):
+        self.assertEqual(cso2iso._pick_align(1800 * 1024 * 1024, 2048), 0)
+        self.assertEqual(cso2iso._pick_align(2 ** 31 - 64 * 1024 * 1024, 2048), 0)
+        self.assertEqual(cso2iso._pick_align(2 ** 31, 2048), 1)
+        self.assertEqual(cso2iso._pick_align(8 * 1024 ** 3, 2048), 3)
+
+    def test_offsets_past_the_index_limit_are_refused(self):
+        self.assertEqual(cso2iso._index_entry(2 ** 31 - 1, 0), 2 ** 31 - 1)
+        with self.assertRaisesRegex(CsoError, "index alignment of 0"):
+            cso2iso._index_entry(2 ** 31, 0)
+
+    def test_refuses_an_already_compressed_image(self):
+        source = self.write("game.cso", make_cso(b"hello"))
+        with self.assertRaisesRegex(CsoError, "already a compressed image"):
+            cso2iso.compress(source, self.tmp / "game2.cso")
+
+    def test_refuses_an_empty_file(self):
+        with self.assertRaisesRegex(CsoError, "empty"):
+            cso2iso.compress(self.write("empty.iso", b""), self.tmp / "empty.cso")
+        self.assertFalse((self.tmp / "empty.cso").exists())
+        self.assertFalse((self.tmp / "empty.cso.part").exists())
+
+    def test_refuses_to_overwrite(self):
+        source = self.write("game.iso", b"payload")
+        destination = self.write("game.cso", b"do not clobber me")
+        with self.assertRaisesRegex(CsoError, "already exists"):
+            cso2iso.compress(source, destination)
+        self.assertEqual(destination.read_bytes(), b"do not clobber me")
+
+
+# --------------------------------------------------------------------------
 # error handling
 # --------------------------------------------------------------------------
 
@@ -343,6 +477,12 @@ class TestCommandLine(TempDirCase):
             sys.stdout, sys.stderr = saved
         return code, out.getvalue(), err.getvalue()
 
+    def expand(self, image):
+        source = self.write("check.cso", image)
+        destination = self.tmp / "check.iso"
+        cso2iso.convert(source, destination, force=True)
+        return destination.read_bytes()
+
     def test_converts_next_to_the_source(self):
         data = sample_data(2048 * 6)
         source = self.write("game.cso", make_cso(data))
@@ -406,6 +546,46 @@ class TestCommandLine(TempDirCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, "")
         self.assertEqual(err, "")
+
+    def test_iso_is_compressed_next_to_the_source(self):
+        data = sample_data(2048 * 6 + 3)
+        source = self.write("game.iso", data)
+        code, out, _ = self.run_cli(source)
+        self.assertEqual(code, 0)
+        self.assertIn("game.cso", out)
+        self.assertIn("of the original", out)
+        image = (self.tmp / "game.cso").read_bytes()
+        self.assertEqual(image[:4], b"CISO")
+        self.assertEqual(self.expand(image), data)
+
+    def test_iso9660_disc_is_compressed_whatever_its_name(self):
+        data = bytearray(sample_data(2048 * 20))
+        data[0x8001:0x8006] = b"CD001"
+        source = self.write("disc.img", bytes(data))
+        code, _, _ = self.run_cli(source)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.expand((self.tmp / "disc.cso").read_bytes()), bytes(data))
+
+    def test_compress_flag_forces_compression(self):
+        source = self.write("data.bin", b"some bytes")
+        code, _, _ = self.run_cli("--compress", source)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.expand((self.tmp / "data.cso").read_bytes()), b"some bytes")
+
+    def test_compress_flag_refuses_a_cso(self):
+        source = self.write("game.cso", make_cso(b"payload"))
+        code, _, err = self.run_cli("--compress", source)
+        self.assertEqual(code, 1)
+        self.assertIn("already a compressed image", err)
+
+    def test_mixed_inputs_go_both_ways(self):
+        first = self.write("one.cso", make_cso(b"first image"))
+        second = self.write("two.iso", b"second image")
+        out_dir = self.tmp / "out"
+        code, _, _ = self.run_cli(first, second, "-o", out_dir)
+        self.assertEqual(code, 0)
+        self.assertEqual((out_dir / "one.iso").read_bytes(), b"first image")
+        self.assertEqual(self.expand((out_dir / "two.cso").read_bytes()), b"second image")
 
     def test_no_arguments_shows_help(self):
         code, out, _ = self.run_cli("--no-gui")
