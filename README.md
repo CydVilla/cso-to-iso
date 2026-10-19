@@ -35,10 +35,11 @@ $ cso2iso 'Vice City Stories.iso'
 ## No install at all
 
 The [download page](https://cydvilla.github.io/cso-to-iso/#browser) converts
-files in the browser. Drop a `.cso` in and the `.iso` comes back out. Nothing is
-uploaded, since the work happens on your own machine, and there is no download
-and no security prompt to click through. The browser converter only expands
-images; compressing an ISO needs the program below.
+files in the browser. Drop a `.cso` in and the `.iso` comes back out, or drop an
+`.iso` in for a `.cso`. Nothing is uploaded, since the work happens on your own
+machine, and there is no download and no security prompt to click through.
+Compressing in the browser runs on a single core, so a full UMD takes a minute
+or so there against a few seconds with the program below.
 
 ## Download
 
@@ -231,8 +232,9 @@ The browser converter lives in [docs/convert.js](docs/convert.js) and shares its
 logic with the Python version. It vendors one third-party file,
 [fflate](https://github.com/101arrowz/fflate) under the MIT licence, because a
 synchronous inflate is around five times faster on 2 KB blocks than building a
-`DecompressionStream` per block. If that file fails to load the page falls back
-to the browser's own decompressor.
+`DecompressionStream` per block, and its deflate does the same for compressing.
+If that file fails to load the page falls back to the browser's own
+`DecompressionStream` and `CompressionStream`.
 
 To build a standalone binary for the system you are on:
 

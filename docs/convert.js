@@ -1,7 +1,8 @@
 /* cso2iso in the browser. MIT licensed, same as the rest of the project.
  *
  * Mirrors cso2iso.py: parse the header, walk the block index, expand each
- * block and write the bytes out in order. Nothing is uploaded anywhere; the
+ * block and write the bytes out in order, or the reverse, packing a plain ISO
+ * into a CISO v1 image block by block. Nothing is uploaded anywhere; the
  * file is read locally through the File API and written back with either the
  * File System Access API or a blob download.
  */
@@ -192,8 +193,11 @@
     return this.buf.subarray(from, from + length);
   };
 
+  /* Sinks take the output in order. Compressing also needs `reserve`, which
+     holds space for the block index at the very start, and `patch`, which
+     fills it in once every block is down. */
   function blobSink() {
-    var parts = [], pending = [], pendingBytes = 0;
+    var parts = [], pending = [], pendingBytes = 0, prefix = null;
     return {
       kind: "blob",
       write: function (chunk) {
@@ -204,8 +208,11 @@
           pending = []; pendingBytes = 0;
         }
       },
+      reserve: function (length) { prefix = new Uint8Array(length); },
+      patch: function (position, chunk) { prefix.set(chunk, position); },
       finish: function () {
         if (pending.length) parts.push(new Blob(pending));
+        if (prefix) parts.unshift(prefix);
         return new Blob(parts, { type: "application/octet-stream" });
       }
     };
@@ -216,6 +223,10 @@
     return {
       kind: "disk",
       write: function (chunk) { return stream.write(chunk); },
+      reserve: function (length) { return stream.write(new Uint8Array(length)); },
+      patch: function (position, chunk) {
+        return stream.write({ type: "write", position: position, data: chunk });
+      },
       finish: async function () { await stream.close(); return null; }
     };
   }
@@ -297,14 +308,161 @@
     };
   }
 
+  /* ---- compressing, the reverse direction ----
+     Mirrors compress() in cso2iso.py: CISO v1, level 9 raw deflate in 2048
+     byte blocks, blocks that do not shrink stored as they are and flagged in
+     the index, a partial final block padded with zeros. That is the variant
+     PSP custom firmware, Adrenaline and PPSSPP all read. */
+
+  var COMPRESS_BLOCK = 2048;
+  var COMPRESS_LEVEL = 9;
+  var ISO9660_AT = 0x8001;
+
+  /* Which way a file should go: "expand" for a compressed image, "compress"
+     for a plain ISO, null for anything else. Like the Python version, an ISO
+     is recognised by its volume descriptor or, failing that, its name. */
+  async function sniff(file) {
+    var head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    var magic = String.fromCharCode.apply(null, head);
+    if (magic === CISO || magic === ZISO || magic === DAX) return "expand";
+    if (file.size > ISO9660_AT + 5) {
+      var sig = new Uint8Array(await file.slice(ISO9660_AT, ISO9660_AT + 5).arrayBuffer());
+      if (String.fromCharCode.apply(null, sig) === "CD001") return "compress";
+    }
+    if (/\.iso$/i.test(file.name)) return "compress";
+    return null;
+  }
+
+  /* Index entries hold 31 bits of offset, so the output must stay under 2 GiB
+     unless offsets are scaled by an alignment. Assumes every block is stored
+     whole and needs the most padding, so it is safe before compressing. */
+  function pickAlign(totalBytes, blockSize) {
+    var numBlocks = Math.ceil(totalBytes / blockSize);
+    var base = HEADER_SIZE + (numBlocks + 1) * 4;
+    for (var align = 0; align < 32; align++) {
+      var step = Math.pow(2, align);
+      var worst = base + numBlocks * (blockSize + step - 1) + step;
+      if (Math.floor(worst / step) <= POSITION_MASK) return align;
+    }
+    throw CsoError("image is too large to compress");
+  }
+
+  function deflateFast(block) {
+    return window.fflate.deflateSync(block, { level: COMPRESS_LEVEL });
+  }
+
+  async function deflateRaw(block) {
+    var cs = new CompressionStream("deflate-raw");
+    var bytes = await new Response(new Blob([block]).stream().pipeThrough(cs)).arrayBuffer();
+    return new Uint8Array(bytes);
+  }
+
+  async function compress(file, sink, onProgress) {
+    var totalBytes = file.size;
+    if (!totalBytes) throw CsoError("file is empty, there is nothing to compress");
+    if (await sniff(file) === "expand") throw CsoError("file is already a compressed image");
+
+    var blockSize = COMPRESS_BLOCK;
+    var align = pickAlign(totalBytes, blockSize);
+    var step = Math.pow(2, align);
+    var numBlocks = Math.ceil(totalBytes / blockSize);
+    var indexSize = (numBlocks + 1) * 4;
+    var index = new Uint32Array(numBlocks + 1);
+
+    var fast = !!(window.fflate && typeof window.fflate.deflateSync === "function");
+    var reader = new Reader(file);
+    var block = new Uint8Array(blockSize);
+
+    await sink.reserve(HEADER_SIZE + indexSize);
+    var position = HEADER_SIZE + indexSize;
+
+    var batchSize = Math.max(BATCH, blockSize * 2 + step);
+    var batch = new Uint8Array(batchSize);
+    var used = 0;
+    async function put(bytes) {
+      if (used + bytes.length > batchSize) {
+        await sink.write(batch.subarray(0, used));
+        batch = new Uint8Array(batchSize);
+        used = 0;
+      }
+      batch.set(bytes, used);
+      used += bytes.length;
+      position += bytes.length;
+    }
+
+    var started = performance.now();
+    var lastPaint = started;
+
+    for (var i = 0; i < numBlocks; i++) {
+      var start = i * blockSize;
+      var length = Math.min(blockSize, totalBytes - start);
+      var raw = reader.peek(start, length);
+      if (raw === null) raw = await reader.bytes(start, length);
+      if (length < blockSize) {
+        block.fill(0);
+        block.set(raw);
+        raw = block;
+      }
+
+      var packed = fast ? deflateFast(raw) : await deflateRaw(raw);
+      var plain = packed.length >= blockSize;
+
+      var padding = (step - position % step) % step;
+      if (padding) await put(new Uint8Array(padding));
+      var entry = position / step;
+      if (entry > POSITION_MASK) throw CsoError("compressed image outgrew its index alignment");
+      index[i] = plain ? (entry | PLAIN_FLAG) >>> 0 : entry;
+      await put(plain ? raw : packed);
+
+      if (i % 256 === 0 || i === numBlocks - 1) {
+        var now = performance.now();
+        if (now - lastPaint >= 50 || i === numBlocks - 1) {
+          lastPaint = now;
+          if (onProgress) onProgress(Math.min(start + length, totalBytes), totalBytes, (now - started) / 1000);
+          await new Promise(function (resume) { setTimeout(resume, 0); });
+        }
+      }
+    }
+    var tail = (step - position % step) % step;
+    if (tail) await put(new Uint8Array(tail));
+    index[numBlocks] = position / step;
+    if (used) await sink.write(batch.subarray(0, used));
+
+    var head = new Uint8Array(HEADER_SIZE);
+    var view = new DataView(head.buffer);
+    for (var c = 0; c < 4; c++) head[c] = CISO.charCodeAt(c);
+    view.setUint32(4, HEADER_SIZE, true);
+    view.setUint32(8, totalBytes % 4294967296, true);
+    view.setUint32(12, Math.floor(totalBytes / 4294967296), true);
+    view.setUint32(16, blockSize, true);
+    head[20] = 1;
+    head[21] = align;
+    await sink.patch(0, head);
+    var indexBytes = new Uint8Array(indexSize);
+    var indexView = new DataView(indexBytes.buffer);
+    for (var k = 0; k <= numBlocks; k++) indexView.setUint32(k * 4, index[k], true);
+    await sink.patch(HEADER_SIZE, indexBytes);
+
+    var result = await sink.finish();
+    return {
+      bytes: position, iso: totalBytes, blob: result,
+      seconds: (performance.now() - started) / 1000,
+      encoder: fast ? "fflate" : "CompressionStream"
+    };
+  }
+
   window.cso2iso = {
     parseHeader: parseHeader,
     lz4Decompress: lz4Decompress,
     inflateRaw: inflateRaw,
     convert: convert,
+    sniff: sniff,
+    compress: compress,
     blobSink: blobSink,
     fileSink: fileSink,
     supported: typeof DecompressionStream === "function",
+    canCompress: typeof CompressionStream === "function" ||
+      !!(window.fflate && typeof window.fflate.deflateSync === "function"),
     canSaveToDisk: typeof window.showSaveFilePicker === "function"
   };
 })();

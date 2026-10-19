@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cso2iso — turn .cso files back into .iso</title>
-<meta name="description" content="A tiny, free converter that expands compressed .cso and .zso disc images back into plain .iso files. Windows, macOS and Linux.">
+<title>cso2iso — turn .cso files back into .iso, and back again</title>
+<meta name="description" content="A tiny, free converter that expands compressed .cso and .zso disc images back into plain .iso files, and compresses .iso files into .cso. Windows, macOS and Linux.">
 <meta property="og:title" content="cso2iso">
-<meta property="og:description" content="Turn compressed .cso and .zso disc images back into plain .iso files. No install, no dependencies.">
+<meta property="og:description" content="Turn compressed .cso and .zso disc images back into plain .iso files, or compress an .iso into a .cso. No install, no dependencies.">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%236c5ce7'/><circle cx='16' cy='16' r='4.5' fill='white'/></svg>">
 <style>
@@ -178,7 +178,7 @@
       </g>
     </svg>
     <h1>cso2iso</h1>
-    <p class="tagline">Expands compressed <code>.cso</code> and <code>.zso</code> disc images back into plain <code>.iso</code> files. One small download, nothing to install.</p>
+    <p class="tagline">Expands compressed <code>.cso</code> and <code>.zso</code> disc images back into plain <code>.iso</code> files, and packs an <code>.iso</code> into a <code>.cso</code>. One small download, nothing to install.</p>
     <div class="badges">
       <img src="https://github.com/CydVilla/cso-to-iso/actions/workflows/ci.yml/badge.svg" alt="Build status">
       <img src="https://img.shields.io/github/v/release/CydVilla/cso-to-iso?color=5b4bd6&label=release" alt="Latest release">
@@ -198,8 +198,8 @@
     <p class="lede">Nothing is uploaded. The file is read on your own machine, converted here, and saved straight back.</p>
 
     <div class="drop" id="drop">
-      <input type="file" id="picker" accept=".cso,.zso,.ciso" hidden>
-      <strong>Drop a .cso or .zso file here</strong>
+      <input type="file" id="picker" accept=".cso,.zso,.ciso,.iso" hidden>
+      <strong>Drop a .cso, .zso or .iso file here</strong>
       <p class="muted">or <button type="button" class="linkbtn" id="browse">choose a file</button></p>
     </div>
 
@@ -311,15 +311,17 @@ pipx install git+https://github.com/CydVilla/cso-to-iso</pre>
     <h2>Using it</h2>
     <p class="lede">One image, a whole folder, or just a look inside.</p>
     <pre>cso2iso game.cso                 <span class="c"># writes game.iso next to it</span>
-cso2iso game.cso out/game.iso    <span class="c"># choose the name</span>
+cso2iso game.iso                 <span class="c"># writes game.cso next to it</span>
+cso2iso game.cso -o out/game.iso <span class="c"># choose the name</span>
 cso2iso *.cso -o isos/           <span class="c"># convert a folder</span>
 cso2iso --info game.cso          <span class="c"># show what is inside, convert nothing</span></pre>
     <table>
       <tr><th>Input</th><th>Notes</th></tr>
       <tr><td><code>.cso</code> / <code>.ciso</code></td><td>CISO v0, v1 and v2, the format almost every tool writes</td></tr>
       <tr><td><code>.zso</code></td><td>ZISO, the LZ4 flavour</td></tr>
+      <tr><td><code>.iso</code></td><td>Compressed to CISO v1, which PSP custom firmware, Adrenaline and PPSSPP all read</td></tr>
     </table>
-    <p class="note">Output is byte-for-byte identical to the ISO the image was made from. A run that is interrupted never leaves a half-written ISO behind.</p>
+    <p class="note">An expanded ISO is byte-for-byte identical to the one the image was made from. A run that is interrupted never leaves a half-written file behind.</p>
   </div>
 </section>
 
@@ -346,7 +348,7 @@ cso2iso --info game.cso          <span class="c"># show what is inside, convert 
     var actions = document.querySelector("#job .actions");
     var go = document.getElementById("go");
     var note = document.getElementById("browser-note");
-    var current = null, header = null, busy = false;
+    var current = null, header = null, mode = null, busy = false;
 
     function size(n) {
       var units = ["B", "KiB", "MiB", "GiB", "TiB"], i = 0;
@@ -370,24 +372,41 @@ cso2iso --info game.cso          <span class="c"># show what is inside, convert 
       return;
     }
 
+    var LABELS = { expand: "Convert to ISO", compress: "Compress to CSO" };
+
     async function load(file) {
       if (busy) return;
-      current = file; header = null;
+      current = file; header = null; mode = null;
       job.hidden = false;
       jobName.textContent = file.name;
       jobBar.style.width = "0";
       actions.hidden = false;
       go.disabled = false;
-      go.textContent = "Convert to ISO";
+      go.textContent = "Convert";
       try {
-        var head = new Uint8Array(await file.slice(0, 24).arrayBuffer());
-        header = cso2iso.parseHeader(head);
-        jobMeta.textContent = header.formatName + " · " + size(file.size) +
-          " compressed · " + size(header.totalBytes) + " once expanded";
-        var big = header.totalBytes > 1.5 * 1024 * 1024 * 1024;
+        // a plain ISO is compressed, anything else is read as a compressed image,
+        // which is also what reports a clear error for files that are neither
+        mode = (await cso2iso.sniff(file)) === "compress" ? "compress" : "expand";
+        var expanded;
+        if (mode === "compress") {
+          if (!cso2iso.canCompress) throw new Error("This browser cannot compress in page. Use one of the downloads below instead.");
+          header = { totalBytes: file.size };
+          expanded = file.size;
+          jobMeta.textContent = "Plain ISO · " + size(file.size) + " · will be packed into a CISO v1 .cso";
+        } else {
+          var head = new Uint8Array(await file.slice(0, 24).arrayBuffer());
+          header = cso2iso.parseHeader(head);
+          expanded = header.totalBytes;
+          jobMeta.textContent = header.formatName + " · " + size(file.size) +
+            " compressed · " + size(header.totalBytes) + " once expanded";
+        }
+        go.textContent = LABELS[mode];
+        var big = expanded > 1.5 * 1024 * 1024 * 1024;
         say(big && !cso2iso.canSaveToDisk
           ? "Large image. This browser has to build it in memory, so Chrome or Edge will cope better."
-          : "Ready.");
+          : mode === "compress"
+            ? "Ready. Compressing runs on one core here, so allow a minute or two for a full UMD; the download is several times faster."
+            : "Ready.");
       } catch (err) {
         jobMeta.textContent = size(file.size);
         actions.hidden = true;
@@ -397,13 +416,15 @@ cso2iso --info game.cso          <span class="c"># show what is inside, convert 
 
     async function run() {
       if (!current || !header || busy) return;
-      var target = current.name.replace(/\.(cso|zso|ciso)$/i, "") + ".iso";
+      var ext = mode === "compress" ? ".cso" : ".iso";
+      var target = current.name.replace(/\.(cso|zso|ciso|iso)$/i, "") + ext;
       var sink, handle = null;
       try {
         if (cso2iso.canSaveToDisk) {
           handle = await window.showSaveFilePicker({
             suggestedName: target,
-            types: [{ description: "Disc image", accept: { "application/octet-stream": [".iso"] } }]
+            types: [{ description: mode === "compress" ? "Compressed disc image" : "Disc image",
+                      accept: { "application/octet-stream": [ext] } }]
           });
           sink = await cso2iso.fileSink(handle);
         } else {
@@ -417,9 +438,10 @@ cso2iso --info game.cso          <span class="c"># show what is inside, convert 
 
       busy = true;
       go.disabled = true;
-      go.textContent = "Converting…";
+      go.textContent = mode === "compress" ? "Compressing…" : "Converting…";
       try {
-        var result = await cso2iso.convert(current, sink, function (done, total, seconds) {
+        var work = mode === "compress" ? cso2iso.compress : cso2iso.convert;
+        var result = await work(current, sink, function (done, total, seconds) {
           var fraction = done / total;
           jobBar.style.width = (fraction * 100).toFixed(1) + "%";
           var rate = done / Math.max(seconds, 0.001);
